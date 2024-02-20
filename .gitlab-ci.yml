@@ -1,0 +1,137 @@
+image: mcr.microsoft.com/dotnet/sdk:latest
+
+variables:
+    OBJECTS_DIRECTORY: "obj"
+    NUGET_PACKAGES_DIRECTORY: ".nuget"
+    SOURCE_CODE_PATH: "*/*/"
+
+cache:
+    key: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+        - "$SOURCE_CODE_PATH$OBJECTS_DIRECTORY/project.assets.json"
+        - "$SOURCE_CODE_PATH$OBJECTS_DIRECTORY/*.csproj.nuget.*"
+        - "$NUGET_PACKAGES_DIRECTORY"
+    policy: pull-push
+
+before_script:
+    - export APP_VERSION=$(cat version.txt)
+    - echo "Versi saat ini:"
+    - echo $APP_VERSION
+
+stages:
+    - config
+    - check
+    - build
+    - deploy
+    - bump-ver
+
+config-ci:
+    stage: config
+    tags:
+        - b7-cam-runner
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    script:
+        - |
+            if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ] || [ "$CI_DEFAULT_BRANCH" == "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" ]; then 
+              sed -i -e "s/{ENVIRONMENT_NAME}/Production/g" Dockerfile ocp-deployment.yaml
+            else 
+              sed -i -e "s/{ENVIRONMENT_NAME}/Development/g" Dockerfile ocp-deployment.yaml
+            fi
+    artifacts:
+        paths:
+            - Dockerfile
+            - ocp-deployment.yaml
+
+.code-check-v2:
+    stage: check
+    tags:
+        - b7-cam-runner
+    image: mcr.microsoft.com/dotnet/sdk:6.0
+    variables:
+        SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+        GIT_DEPTH: "0"
+    cache:
+        key: "${CI_JOB_NAME}"
+        paths:
+            - .sonar/cache
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    script:
+        - apt-get update
+        - apt-get install --yes openjdk-17-jre
+        - dotnet tool install --global dotnet-sonarscanner
+        - dotnet tool install --global dotnet-coverage
+        - export PATH="$PATH:/root/.dotnet/tools"
+        - dotnet sonarscanner begin /k:"b7-cam-master-role" /d:sonar.token="$SONAR_TOKEN" /d:sonar.host.url="$SONAR_HOST_URL" /d:sonar.coverage.exclusions=**/*.cs /d:sonar.cs.vscoveragexml.reportsPaths=coverage.xml /d:sonar.qualitygate.wait=true
+        - dotnet build --no-incremental
+        - dotnet-coverage collect "dotnet test" -f xml -o "coverage.xml"
+        - dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
+
+build-image:
+    stage: build
+    image: docker
+    services:
+        - docker:dind
+    tags:
+        - b7-cam-runner
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    before_script:
+        - export APP_VERSION=$(cat version.txt)
+        - |
+            csproj_file=$(ls | grep .csproj)
+            sln_file=$(ls | grep .sln)
+            full_namespace=$CI_PROJECT_NAMESPACE
+            mv "$csproj_file" "$CI_PROJECT_NAME.csproj"
+            sed -i "s/$csproj_file/$CI_PROJECT_NAME.csproj/g" "$sln_file"
+            mv "$sln_file" "$CI_PROJECT_NAME.sln"
+    script:
+        - docker login -u $ARTIFACTORY_USER -p $ARTIFACTORY_PWD $ARTIFACTORY_URL
+        - echo $APP_VERSION
+        - sed -i -e "s/{ARTIFACTORY_URL}/${ARTIFACTORY_URL}/g" -e "s/{PROJECT_NAME}/${CI_PROJECT_NAME}/g" Dockerfile
+        - docker build -t $CI_PROJECT_NAME:$APP_VERSION .
+        - docker tag $CI_PROJECT_NAME:$APP_VERSION $ARTIFACTORY_URL/cam/be/master-role-list/$CI_PROJECT_NAME:$APP_VERSION
+        - docker push $ARTIFACTORY_URL/cam/be/master-role-list/$CI_PROJECT_NAME:$APP_VERSION
+        - docker rmi $ARTIFACTORY_URL/cam/be/master-role-list/$CI_PROJECT_NAME:$APP_VERSION
+        - docker rmi $CI_PROJECT_NAME:$APP_VERSION
+
+deploy-image:
+    stage: deploy
+    image: openshift/origin-cli
+    tags:
+        - b7-cam-runner
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    before_script:
+        - export APP_VERSION=$(cat version.txt)
+    script:
+        - oc login $OPENSHIFT_URL -u $OPENSHIFT_LOGIN -p $OPENSHIFT_PWD --insecure-skip-tls-verify=true
+        - oc new-project $NAMESPACE || oc project $NAMESPACE
+        - oc delete secret $CI_PROJECT_NAME-secret --ignore-not-found
+        - oc create secret docker-registry $CI_PROJECT_NAME-secret --docker-server=$ARTIFACTORY_URL --docker-username=b7user --docker-password=Kalbefarm4
+        - cat ocp-deployment.yaml | sed "s/{SERVICE_NAME}/master-role-list/g" | sed "s/{APP_NAME}/${CI_PROJECT_NAME}/g" | sed "s/{ARTIFACTORY_REPO}/${ARTIFACTORY_URL}/g"  | sed "s/{IMG_NAME}/${CI_PROJECT_NAME}/g"| sed "s/{IMG_TAG}/${APP_VERSION}/g"  | sed "s/{NAMESPACE}/${NAMESPACE}/g" | sed "s,{APP_URL},${CI_PROJECT_NAME}-${NAMESPACE},g" | oc apply -n "$NAMESPACE" -f -
+        - oc rollout status deployment/$CI_PROJECT_NAME -n $NAMESPACE
+        - echo $CONSOLE_OPENSHIFT_URL$NAMESPACE/deployments/$deploymentName
+        - oc get route $deploymentName -o custom-columns=ROUTE:.spec.host --no-headers -n $NAMESPACE
+
+bump-version:
+    stage: bump-ver
+    image: python:3.9
+    tags:
+        - b7-cam-runner
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    before_script:
+        - git config user.email "bump@version.com"
+        - git config user.name "Version Bumper"
+        - git remote set-url origin $REMOTE_URL
+    script:
+        - git fetch origin development
+        - git checkout development || git checkout -b development
+        - git restore .
+        - git rebase origin/development
+        - NEW_VER=$(python bump-ver.py)
+        - git add version.txt
+        - git commit -m "Up versi ke $NEW_VER [skip ci]"
+        - git push -u origin development
